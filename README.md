@@ -324,6 +324,15 @@ Without a `SessionParticipantTracker`, the IdP cannot contact the session's othe
 
 With `idpslo.BackChannel`, the IdP sends LogoutRequests to the SOAP endpoints in the service providers' metadata. Its default client connects only to public addresses; a client given with `idpslo.WithHTTPClient` is used as it is (see [Limiting where the service provider connects](#limiting-where-the-service-provider-connects)).
 
+### Releasing attributes
+
+`DefaultAssertionMaker` answers every `RequestedAttribute` in the service provider's `AttributeConsumingService` (the one the request's `AttributeConsumingServiceIndex` names, or the default one), whatever the attribute is called:
+
+- the five plain (`basic`/unspecified) name groups it has always understood — `email`, `name`, `given name`, `surname` and `uid`, matched with punctuation removed but case-sensitively — keep working and still answer with an empty value when the session has none;
+- any other name is matched **exactly**, case-sensitively, against the session's attributes. This covers URI-format OID names such as `attrname.EmployeeNumber` and `attrname.Mail`, and uncommon plain names. Put names the fixed `Session` fields do not model in `Session.CustomAttributes`, under the same `Name` (and `NameFormat`) the service provider requests; a requested attribute the session cannot provide is omitted, never silently dropped or answered with invented data. A request without a `NameFormat` (unspecified) matches an attribute of any `NameFormat`.
+
+For backwards compatibility the IdP then also publishes every other attribute the session carries, as it always has — which is why a service provider that requests nothing currently receives the full set. Set `IdentityProvider.ReleaseRequestedAttributesOnly` to switch to minimum disclosure: only requested, satisfiable attributes are published, in the request's order, and a service provider that requests nothing receives no attributes. With the flag on, a request naming an `AttributeConsumingServiceIndex` absent from the service provider's metadata is answered with a `Requester`/`RequestUnsupported` error Response instead of being silently served from the default service. `x/samlidp` offers the same policy per response through `ReleaseRequestedAttributesOnly`, plus `RequestedAttributes` and `MissingRequiredAttributes`.
+
 ## Support
 
 The SAML standard is huge and complex with many dark corners and strange, unused features. This package implements the most commonly used subset of these features required to provide a single sign on experience. The package supports at least the subset of SAML known as [interoperable SAML](https://kantarainitiative.github.io/SAMLprofiles/saml2int.html).

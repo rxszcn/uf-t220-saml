@@ -24,7 +24,6 @@ import (
 	"github.com/beevik/etree"
 	dsig "github.com/russellhaering/goxmldsig"
 
-	"github.com/crewjam/saml/attrname"
 	"github.com/crewjam/saml/internal/xmlroundtrip"
 
 	"github.com/crewjam/saml/internal/signerutil"
@@ -596,6 +595,32 @@ type IdentityProvider struct {
 	// in the map is not ranked, and only satisfies a request that names it.
 	// If nil, DefaultAuthnContextClassStrengths is used.
 	AuthnContextClassStrengths map[string]int
+
+	// ReleaseRequestedAttributesOnly makes DefaultAssertionMaker release
+	// only the attributes the service provider's metadata asks for in the
+	// AttributeConsumingService the request names, instead of every
+	// attribute the session carries. It is off by default for backwards
+	// compatibility.
+	//
+	// When on, a service provider whose metadata lists no
+	// AttributeConsumingService, or whose default one lists no
+	// RequestedAttribute, receives no attributes: an attribute that was not
+	// requested is not published, which is what a minimum-disclosure policy
+	// and a compliance review of attribute release require. A request that
+	// names an AttributeConsumingServiceIndex absent from the service
+	// provider's metadata fails with a Requester error Response carrying
+	// RequestUnsupported, instead of being answered from the default
+	// service.
+	//
+	// Whether on or off, every RequestedAttribute is honored by name: the
+	// five plain (basic/unspecified) name groups this IdP has always
+	// understood still work, and any other name, including a URI-format
+	// OID such as attrname.EmployeeNumber, is matched exactly against the
+	// session's attributes (use Session.CustomAttributes to carry names the
+	// fixed Session fields do not cover). A requested attribute the session
+	// has no value for is omitted; the built-in basic name groups keep
+	// their historical behavior of answering with an empty value.
+	ReleaseRequestedAttributesOnly bool
 }
 
 // limits returns the clock skew and issue delay this IdentityProvider
@@ -1516,195 +1541,45 @@ func (DefaultAssertionMaker) MakeAssertion(req *IdpAuthnRequest, session *Sessio
 
 	attributes := []Attribute{}
 
-	attributeConsumingService := defaultAttributeConsumingService(req.SPSSODescriptor)
+	attributeConsumingService, err := req.selectAttributeConsumingService(req.IDP.releaseRequestedOnly())
+	if err != nil {
+		return err
+	}
 
-	for _, requestedAttribute := range attributeConsumingService.RequestedAttributes {
-		// "If no NameFormat value is provided, the identifier
-		// urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified ... is in
-		// effect" (saml-core §2.7.3.1).
-		switch requestedAttribute.NameFormat {
-		case "", attrname.FormatBasic, attrname.FormatUnspecified:
-			// The name is compared case-sensitively: string values "MUST be
-			// compared using an exact binary comparison" and implementations
-			// "MUST NOT depend on case-insensitive string comparisons"
-			// (saml-core §1.3.1). Punctuation is removed before comparing,
-			// as this code always has, so "email_address" matches
-			// "emailaddress"; that is a convenience beyond the specification.
-			attrName := nonAlphanumeric.ReplaceAllString(requestedAttribute.Name, "")
-			switch attrName {
-			case "email", "emailaddress":
-				attributes = append(attributes, Attribute{
-					FriendlyName: requestedAttribute.FriendlyName,
-					Name:         requestedAttribute.Name,
-					NameFormat:   requestedAttribute.NameFormat,
-					Values: []AttributeValue{{
-						Type:  "xs:string",
-						Value: session.UserEmail,
-					}},
-				})
-			case "name", "fullname", "cn", "commonname":
-				attributes = append(attributes, Attribute{
-					FriendlyName: requestedAttribute.FriendlyName,
-					Name:         requestedAttribute.Name,
-					NameFormat:   requestedAttribute.NameFormat,
-					Values: []AttributeValue{{
-						Type:  "xs:string",
-						Value: session.UserCommonName,
-					}},
-				})
-			case "givenname", "firstname":
-				attributes = append(attributes, Attribute{
-					FriendlyName: requestedAttribute.FriendlyName,
-					Name:         requestedAttribute.Name,
-					NameFormat:   requestedAttribute.NameFormat,
-					Values: []AttributeValue{{
-						Type:  "xs:string",
-						Value: session.UserGivenName,
-					}},
-				})
-			case "surname", "lastname", "familyname":
-				attributes = append(attributes, Attribute{
-					FriendlyName: requestedAttribute.FriendlyName,
-					Name:         requestedAttribute.Name,
-					NameFormat:   requestedAttribute.NameFormat,
-					Values: []AttributeValue{{
-						Type:  "xs:string",
-						Value: session.UserSurname,
-					}},
-				})
-			case "uid", "user", "userid":
-				attributes = append(attributes, Attribute{
-					FriendlyName: requestedAttribute.FriendlyName,
-					Name:         requestedAttribute.Name,
-					NameFormat:   requestedAttribute.NameFormat,
-					Values: []AttributeValue{{
-						Type:  "xs:string",
-						Value: session.UserName,
-					}},
-				})
+	available := sessionAttributes(session)
+	// Answer each requested attribute in the order the SP lists it. Every
+	// requested name is honored: the five historical basic name groups keep
+	// their mappings, and any other name, including a URI-format OID, is
+	// matched exactly against the session's attributes instead of being
+	// silently dropped.
+	seen := map[string]bool{}
+	for i := range attributeConsumingService.RequestedAttributes {
+		requested := &attributeConsumingService.RequestedAttributes[i]
+		attr := req.makeRequestedAttribute(*requested, session, available)
+		if attr == nil {
+			continue
+		}
+		key := attributeKey(*attr)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		attributes = append(attributes, *attr)
+	}
+
+	if !req.IDP.releaseRequestedOnly() {
+		// Backwards-compatible release: also publish every other attribute
+		// the session carries, de-duplicating what the request already
+		// covered. With ReleaseRequestedAttributesOnly the loop above is the
+		// whole statement, so an SP that asks for nothing gets nothing.
+		for _, attr := range available {
+			key := attributeKey(attr)
+			if seen[key] {
+				continue
 			}
+			seen[key] = true
+			attributes = append(attributes, attr)
 		}
-	}
-
-	if session.UserName != "" {
-		attributes = append(attributes, Attribute{
-			FriendlyName: "uid",
-			Name:         attrname.UID,
-			NameFormat:   attrname.FormatURI,
-			Values: []AttributeValue{{
-				Type:  "xs:string",
-				Value: session.UserName,
-			}},
-		})
-	}
-
-	if session.UserEmail != "" {
-		attributes = append(attributes, Attribute{
-			FriendlyName: "mail",
-			Name:         attrname.Mail,
-			NameFormat:   attrname.FormatURI,
-			Values: []AttributeValue{{
-				Type:  "xs:string",
-				Value: session.UserEmail,
-			}},
-		})
-	}
-	if session.EduPersonPrincipalName != "" || session.UserEmail != "" {
-		value := session.EduPersonPrincipalName
-		if value == "" {
-			// We used to set eduPersonPrincipalName (urn:oid:1.3.6.1.4.1.5923.1.1.1.6)
-			// to the value of session.UserEmail. It is more correct to set
-			// mail (urn:oid:0.9.2342.19200300.100.1.3). To avoid breaking things,
-			// we preserve the former behavior.
-			value = session.UserEmail
-		}
-
-		attributes = append(attributes, Attribute{
-			FriendlyName: "eduPersonPrincipalName",
-			Name:         attrname.EduPersonPrincipalName,
-			NameFormat:   attrname.FormatURI,
-			Values: []AttributeValue{{
-				Type:  "xs:string",
-				Value: value,
-			}},
-		})
-	}
-	if session.UserSurname != "" {
-		attributes = append(attributes, Attribute{
-			FriendlyName: "sn",
-			Name:         attrname.Surname,
-			NameFormat:   attrname.FormatURI,
-			Values: []AttributeValue{{
-				Type:  "xs:string",
-				Value: session.UserSurname,
-			}},
-		})
-	}
-	if session.UserGivenName != "" {
-		attributes = append(attributes, Attribute{
-			FriendlyName: "givenName",
-			Name:         attrname.GivenName,
-			NameFormat:   attrname.FormatURI,
-			Values: []AttributeValue{{
-				Type:  "xs:string",
-				Value: session.UserGivenName,
-			}},
-		})
-	}
-
-	if session.UserCommonName != "" {
-		attributes = append(attributes, Attribute{
-			FriendlyName: "cn",
-			Name:         attrname.CommonName,
-			NameFormat:   attrname.FormatURI,
-			Values: []AttributeValue{{
-				Type:  "xs:string",
-				Value: session.UserCommonName,
-			}},
-		})
-	}
-
-	if session.UserScopedAffiliation != "" {
-		attributes = append(attributes, Attribute{
-			FriendlyName: "eduPersonScopedAffiliation",
-			Name:         attrname.EduPersonScopedAffiliation,
-			NameFormat:   attrname.FormatURI,
-			Values: []AttributeValue{{
-				Type:  "xs:string",
-				Value: session.UserScopedAffiliation,
-			}},
-		})
-	}
-
-	attributes = append(attributes, session.CustomAttributes...)
-
-	if len(session.Groups) != 0 {
-		groupMemberAttributeValues := make([]AttributeValue, 0, len(session.Groups))
-		for _, group := range session.Groups {
-			groupMemberAttributeValues = append(groupMemberAttributeValues, AttributeValue{
-				Type:  "xs:string",
-				Value: group,
-			})
-		}
-		attributes = append(attributes, Attribute{
-			FriendlyName: "eduPersonAffiliation",
-			Name:         attrname.EduPersonAffiliation,
-			NameFormat:   attrname.FormatURI,
-			Values:       groupMemberAttributeValues,
-		})
-	}
-
-	if session.SubjectID != "" {
-		attributes = append(attributes, Attribute{
-			Name:       attrname.SubjectID,
-			NameFormat: attrname.FormatURI,
-			Values: []AttributeValue{
-				{
-					Type:  "xs:string",
-					Value: session.SubjectID,
-				},
-			},
-		})
 	}
 
 	// Allow for some clock skew at the start of the validity period using
